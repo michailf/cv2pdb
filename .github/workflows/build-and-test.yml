@@ -576,3 +576,74 @@ jobs:
           addr=$(awk '$2 == "T" && $3 == "main" { print $1 }' edge.nm) &&
           off=$(printf '%08X' $((0x$addr - 0x$text))) &&
           grep "S_GPROC32: \[0001:$off\], .*, main\$" edge-cv.dump
+  test-arm64:
+    runs-on: windows-latest
+    needs: build
+    steps:
+      - name: Download bin/
+        uses: actions/download-artifact@v4
+        with:
+          name: bin
+          path: bin
+      - name: download cvdump
+        shell: bash
+        run: curl -Lo cvdump.exe https://raw.githubusercontent.com/microsoft/microsoft-pdb/HEAD/cvdump/cvdump.exe
+      - name: build ARM64 clang program
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -x &&
+          cat >arm64.c <<-\EOF &&
+          __attribute__((noinline)) int get(volatile int *p) { return *p; }
+
+          __attribute__((noinline)) int frame(int a, int b)
+          {
+            volatile int local = a * b;
+            int arr[4] = { a, b, a, b };
+            return get(&local) + arr[a & 3];
+          }
+
+          __attribute__((noinline)) int dynamic(int n)
+          {
+            int buf[n];
+            volatile int marker = n * 7;
+            for (int i = 0; i < n; i++)
+              buf[i] = i + marker;
+            return get(&marker) + buf[n - 1];
+          }
+
+          int start(void) { return frame(1, 2) + dynamic(3); }
+          EOF
+
+          for o in O0 O2; do
+            clang --target=aarch64-w64-mingw32 -fuse-ld=lld -g -$o -nostdlib -mno-stack-arg-probe -Wl,-e,start -o arm64-$o.exe arm64.c &&
+            clang --target=aarch64-w64-mingw32 -g -$o -mno-stack-arg-probe -S -o arm64-$o.s arm64.c &&
+            { llvm-objdump -f arm64-$o.exe | grep 'file format coff-arm64' || { echo "test precondition lost: arm64-$o.exe is not an ARM64 image"; exit 1; }; } &&
+            { awk '/DW_AT_frame_base/ { getline; if ($2 == "109") fp++; if ($2 == "111") sp++; } END { exit !(fp && sp); }' arm64-$o.s ||
+              { echo "test precondition lost: arm64-$o.s does not have both a frame base in FP (DW_OP_reg29) and one in SP (DW_OP_reg31)"; exit 1; }; } || exit 1
+          done
+      - name: convert ARM64 clang program
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -x &&
+          for o in O0 O2; do
+            bin/${{env.BUILD_CONFIGURATION}}*/cv2pdb.exe arm64-$o.exe arm64-$o-cv.exe 2>&1 | tee arm64-$o-cv.log &&
+            ./cvdump.exe -s arm64-$o-cv.pdb >arm64-$o-cv.dump || exit 1
+          done
+      - name: verify target processor (ARM64)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -x &&
+          grep '^ *Target processor: ARM64$' arm64-O0-cv.dump &&
+          grep '^ *Target processor: ARM64$' arm64-O2-cv.dump
+      - name: verify registers of locals (ARM64)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -x &&
+          for o in O0 O2; do
+            awk '$2 == "S_REGREL32:" { split($3, r, "+"); n[r[1]]++; if (r[1] != "sp" && r[1] != "fp") { print; bad++; } }
+                 END { exit !(n["sp"] && n["fp"] && !bad); }' arm64-$o-cv.dump || exit 1
+          done
