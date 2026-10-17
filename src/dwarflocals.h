@@ -8,6 +8,7 @@
 #include <vector>
 
 class CFIIndex;
+class CV2PDB;
 class PEImage;
 
 // The CFA over the addresses [lo, hi), from one row of the call frame information.
@@ -121,6 +122,29 @@ private:
 	std::vector<ListEntry> fbEntries;
 	bool cfaRowsRead = false;
 	std::vector<CFARow> cfaRows;
+};
+
+// Writes S_LOCAL and S_DEFRANGE_* records for the parameters and local variables of one function.
+// The records describe a variable whose location depends on the address, is a register, or is
+// split into pieces.
+class DWARFLocalWriter
+{
+public:
+	// `frameBase` and `bestCFA` are those that `LocalRangeResolver` takes.
+	DWARFLocalWriter(CV2PDB& cv, const DWARF_InfoData& proc, const DIECursor& procCursor,
+	                 const RangeEntry& procRange, const Location& frameBase, const Location& bestCFA);
+
+	// Returns whether the mspdb DLLs are those of Visual Studio 2013 or later. With older DLLs, `add`
+	// appends nothing and returns false.
+	bool enabled() const;
+
+	// Appends the records for `var` to the symbols of the function. Returns false without appending
+	// anything for a variable that this writer does not describe.
+	bool add(const DWARF_InfoData& var, const DIECursor& cursor, bool isParam);
+
+private:
+	CV2PDB& cv;
+	LocalRangeResolver resolver;
 };
 
 #endif
