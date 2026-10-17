@@ -430,6 +430,9 @@ jobs:
     runs-on: windows-latest
     needs: build
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: test
       - name: Download bin/
         uses: actions/download-artifact@v4
         with:
@@ -587,10 +590,116 @@ jobs:
           addr=$(awk '$2 == "T" && $3 == "main" { print $1 }' edge.nm) &&
           off=$(printf '%08X' $((0x$addr - 0x$text))) &&
           grep "S_GPROC32: \[0001:$off\], .*, main\$" edge-cv.dump
+      - name: build and convert programs with location lists (clang)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -x &&
+          cat >locals.c <<-\EOF &&
+          #include <stdio.h>
+          #include <stdlib.h>
+
+          struct pair { long long lo, hi; };
+
+          __attribute__((noinline)) int get(int i) { return rand() + i; }
+
+          __attribute__((noinline)) long long byval(struct pair p, int n)
+          {
+            long long s = get(n);
+            s += get((int)s);
+            return s + p.lo * p.hi;
+          }
+
+          #define R1(i) acc = acc * 31 + get(acc ^ (i));
+          #define R4(i) R1(i) R1(i + 1) R1(i + 2) R1(i + 3)
+          #define R16(i) R4(i) R4(i + 4) R4(i + 8) R4(i + 12)
+          #define R64(i) R16(i) R16(i + 16) R16(i + 32) R16(i + 48)
+          #define R256(i) R64(i) R64(i + 64) R64(i + 128) R64(i + 192)
+          #define R1K(i) R256(i) R256(i + 256) R256(i + 512) R256(i + 768)
+
+          __attribute__((noinline)) int big(int seed)
+          {
+            int acc = get(seed);
+            R1K(0) R1K(1024) R1K(2048) R1K(3072)
+            return acc * seed;
+          }
+
+          int main(int argc, char **argv)
+          {
+            struct pair p = { argc, argc + 1 };
+            printf("%lld %d\n", byval(p, argc), big(argc));
+            return 0;
+          }
+          EOF
+
+          for v in 2 4 5; do
+            clang --target=x86_64-w64-mingw32 -g -gdwarf-$v -O2 -ffunction-sections -S -o locals-d$v.s locals.c &&
+            { awk -v v=$v '/# DW_AT_location$/ { getline; form[$NF] = 1 }
+                           /^\.Ldebug_loc[0-9]+:$/ { getline; if ($1 == ".quad" && $2 == "-1") base = 1 }
+                           /# DW_LLE_base_addressx$/ { basex = 1 }
+                           END { exit !(v == 2 ? form["DW_FORM_data4"] && base : v == 4 ? form["DW_FORM_sec_offset"] && base : basex) }' locals-d$v.s ||
+              { echo "test precondition lost: no DWARF $v location list starts with a base address entry, or the location attributes do not use data4 (DWARF 2) or sec_offset (DWARF 4)"; exit 1; }; } &&
+            clang --target=x86_64-w64-mingw32 -g -gdwarf-$v -O2 -ffunction-sections -c -o locals-d$v.o locals.c &&
+            clang --target=x86_64-w64-mingw32 -fuse-ld=lld -o locals-d$v.exe locals-d$v.o &&
+            { llvm-objdump -p locals-d$v.exe | awk '$1 == "ImageBase" { found = strtonum("0x" $2) >= 2^32 } END { exit !found }' || { echo "test precondition lost: image base below 4 GB"; exit 1; }; } &&
+            llvm-objdump -d --debug-vars=ascii --no-show-raw-insn --disassemble-symbols=byval,big locals-d$v.o >locals-d$v.vars &&
+            bin/${{env.BUILD_CONFIGURATION}}*/cv2pdb.exe locals-d$v.exe locals-cv-d$v.exe &&
+            ./cvdump.exe -s locals-cv-d$v.pdb >locals-cv-d$v.dump || exit 1
+          done
+      - name: verify by-value struct parameters are written without the parameter flag (clang)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -x &&
+          for v in 2 4 5; do
+            { grep -E '[/|]- p = \[RCX\]' locals-d$v.vars && grep -E '[/|]- p = \[RSI\]' locals-d$v.vars ||
+              { echo "test precondition lost: the DWARF does not address the struct parameter of byval through RCX and then RSI"; exit 1; }; } &&
+            awk '$2 == "S_GPROC32:" { inp = $NF == "byval"; var = ""; next }
+                 !inp { next }
+                 $2 == "S_LOCAL:" { var = $NF; if (var == "p") { print; n++; kind = $3 } next }
+                 var == "p" && $2 == "S_DEFRANGE_REGISTER_REL:" && $5 == "0000" && NF == 6 { print; base[$3] = 1; next }
+                 var == "p" && $2 ~ /^S_DEFRANGE_/ { print; bad = 1 }
+                 $2 ~ /^S_/ && $2 !~ /^S_DEFRANGE_/ { var = "" }
+                 END { exit !(n == 1 && kind == "Local:" && base["[rcx"] && base["[rsi"] && !bad) }' locals-cv-d$v.dump || exit 1
+          done
+      - name: verify locals of procedures larger than F000 (clang)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -x &&
+          for v in 2 4 5; do
+            { awk '/^[0-9a-f]+ <big>:$/ { inbig = 1; next }
+                   /^[0-9a-f]+ </ { inbig = 0 }
+                   inbig && /^ *[0-9a-f]+:/ { last = strtonum("0x" substr($1, 1, length($1) - 1)) }
+                   inbig && /[\/|]- seed = R(BX|SI|DI|BP|1[2-5]) *$/ { saved = 1 }
+                   END { exit !(last > 61440 && saved) }' locals-d$v.vars ||
+              { echo "test precondition lost: big is not longer than F000, or seed is not kept in a callee-saved register"; exit 1; }; } &&
+            awk '$2 == "S_GPROC32:" { inp = $NF == "big"; var = ""; next }
+                 !inp { next }
+                 $2 == "S_LOCAL:" { var = $NF; next }
+                 var == "seed" && $2 ~ /^S_DEFRANGE_/ { reg = $2 == "S_DEFRANGE_REGISTER:" ? $3 : ""; next }
+                 var == "seed" && $1 == "Range:" { split($2, s, /[:\]]/); split($4, e, /[:\]]/); rs = strtonum("0x" s[2]); re = strtonum("0x" e[2])
+                                                   if (re - rs > 61440) { print; bad = 1 }
+                                                   if (reg != "" && reg == prev && rs == end) { print reg; print; chained++ }
+                                                   prev = reg; end = re }
+                 $2 ~ /^S_/ && $2 !~ /^S_DEFRANGE_/ { var = "" }
+                 END { exit !(chained && !bad) }' locals-cv-d$v.dump || exit 1
+          done
+      - name: verify S_LOCAL records against the DWARF (clang)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -x &&
+          for v in 2 4 5; do
+            awk -v want='byval:p byval:n byval:s big:seed big:acc' -f test/check-locals.awk locals-d$v.vars locals-d$v.vars locals-cv-d$v.dump || exit 1
+          done
   test-arm64:
     runs-on: windows-latest
     needs: build
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: test
       - name: Download bin/
         uses: actions/download-artifact@v4
         with:
@@ -658,3 +767,54 @@ jobs:
             awk '$2 == "S_REGREL32:" { split($3, r, "+"); n[r[1]]++; if (r[1] != "sp" && r[1] != "fp") { print; bad++; } }
                  END { exit !(n["sp"] && n["fp"] && !bad); }' arm64-$o-cv.dump || exit 1
           done
+      - name: build and convert ARM64 program with location lists (clang)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -x &&
+          cat >locals.c <<-\EOF &&
+          #define CLOBBER __asm__ volatile("" ::: "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "memory")
+
+          volatile int g_seed;
+
+          __attribute__((noinline)) int get(int i) { return g_seed + i; }
+
+          __attribute__((noinline)) int spill(int a, int b)
+          {
+            int s = get(a);
+            CLOBBER;
+            s += get(b);
+            s += get(s);
+            return s * a + b;
+          }
+
+          int start(void) { return spill(1, 2); }
+          EOF
+
+          clang --target=aarch64-w64-mingw32 -g -O2 -c -o locals.o locals.c &&
+          clang --target=aarch64-w64-mingw32 -fuse-ld=lld -nostdlib -Wl,-e,start -o locals.exe locals.o &&
+          llvm-objdump -d --debug-vars=ascii --no-show-raw-insn --disassemble-symbols=spill locals.o >locals.vars &&
+          { awk 'match($0, /[\/|]- ([ab]) = (.*)/, m) { n[m[1]]++; if (m[2] ~ /^W[0-9]+ *$/) w[m[1]] = 1 }
+                 END { exit !(n["a"] > 1 && n["b"] > 1 && w["a"] && w["b"]) }' locals.vars ||
+            { echo "test precondition lost: the parameters of spill do not have location lists that include a W register"; exit 1; }; } &&
+          bin/${{env.BUILD_CONFIGURATION}}*/cv2pdb.exe locals.exe locals-cv.exe &&
+          ./cvdump.exe -s locals-cv.pdb >locals-cv.dump
+      - name: verify registers of S_DEFRANGE records (ARM64)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -x &&
+          awk 'function arm(r) { return r ~ /^([wx]([0-9]|[12][0-9]|30)|sp|fp|lr)$/ }
+               $2 == "S_GPROC32:" { inp = $NF == "spill"; var = ""; next }
+               $2 == "S_LOCAL:" { var = $NF; if (inp && (var == "a" || var == "b")) { print; if ($3 == "Param:") param[var] = 1 } next }
+               $2 == "S_DEFRANGE_REGISTER:" { if (!arm($3)) { print; bad = 1 } if (inp && $3 ~ /^w/) w[var] = 1 }
+               $2 == "S_DEFRANGE_REGISTER_REL:" && !arm(substr($3, 2)) { print; bad = 1 }
+               $2 == "S_DEFRANGE_SUBFIELD_REGISTER:" && !arm($6) { print; bad = 1 }
+               $2 ~ /^S_/ && $2 !~ /^S_DEFRANGE_/ { var = "" }
+               END { exit !(param["a"] && param["b"] && w["a"] && w["b"] && !bad) }' locals-cv.dump
+      - name: verify S_LOCAL records against the DWARF (ARM64)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -x &&
+          awk -v want='spill:a spill:b spill:s' -f test/check-locals.awk locals.vars locals.vars locals-cv.dump
