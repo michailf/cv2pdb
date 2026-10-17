@@ -116,7 +116,7 @@ struct DWARF_Attribute
 	AttrClass type;
 	union
 	{
-		unsigned long addr;
+		uint64_t addr;
 		struct { byte* ptr; unsigned len; } block;
 		unsigned long cons;
 		const char* string;
@@ -140,7 +140,7 @@ struct DWARF_CompilationUnitInfo
 	// Value of the DW_AT_low_pc attribute for the current compilation unit.
 	// Specify the default base address for use in location lists and range
 	// lists.
-	uint32_t base_address;
+	uint64_t base_address;
 
 	// Indirect base address in .debug_addr for addrx forms
 	byte* addr_base;
@@ -225,10 +225,10 @@ struct DWARF_InfoData
 	// Pointer to the sibling DIE in the mapped image.
 	byte* sibling;
 	unsigned long encoding;
-	unsigned long pclo;
-	unsigned long pchi;
+	uint64_t pclo;
+	uint64_t pchi;
 	unsigned long ranges; // -1u when attribute is not present
-	unsigned long pcentry;
+	uint64_t pcentry;
 
 	// Pointer to the DW_AT_type DIE describing the type of this DIE.
 	byte* type;
@@ -464,7 +464,7 @@ struct Location
 
 	Type type;
 	int reg;
-	int off;
+	int64_t off;
 
 	bool is_invalid() const { return type == Invalid; }
 	bool is_inreg() const { return type == InReg; }
@@ -476,16 +476,14 @@ struct Location
 class LOCEntry
 {
 public:
-	// TODO: investigate making these 64bit (or vary). Also consider renaming
-	// to Value0 and Value1 since their meanings varies depending on entry type.
-	unsigned long beg_offset; // or -1U for base address selection entries
-	unsigned long end_offset; // or the base address in base address selection entries
+	unsigned long beg_offset;
+	unsigned long end_offset;
 
 	// DWARF v5 only. See DW_LLE_default_location.
 	bool isDefault;
 
 	// Location description.
-	Location loc;
+	Location loc = { Location::Invalid };
 
 	void addBase(uint32_t base)
 	{
@@ -538,7 +536,7 @@ public:
 	RangeCursor(const DIECursor& parent, unsigned long off);
 
 	const DIECursor& parent;
-	uint32_t base;
+	uint64_t base;
 	byte *end;
 	byte *ptr;
 	bool isRngLists;
@@ -551,8 +549,9 @@ typedef std::unordered_map<std::pair<unsigned, unsigned>, byte*> abbrevMap_t;
 // Attempts to partially evaluate DWARF location expressions.
 // The only supported expressions are those, whose result may be represented
 // as either an absolute value, a register, or a register-relative address.
-// DW_OP_addrx and DW_OP_constx read the .debug_addr table of the unit that
-// `cursor` reads; without a cursor, they yield an invalid location.
+// DW_OP_addr reads an address of the size used by the unit that `cursor` reads.
+// DW_OP_addrx and DW_OP_constx read that unit's .debug_addr table.
+// Without a cursor, all three yield an invalid location.
 Location decodeLocation(const DWARF_Attribute& attr, const Location* frameBase = 0, int at = 0,
                         const DIECursor* cursor = 0);
 
@@ -620,7 +619,7 @@ public:
 
 	// Obtain the address of a string for a strx form.
 	const char *resolveIndirectString(uint32_t index) const ;
-	uint32_t readIndirectAddr(uint32_t index) const ;
+	uint64_t readIndirectAddr(uint32_t index) const ;
 	uint32_t resolveIndirectSecPtr(uint32_t index, const SectionDescriptor &secDesc, byte *baseAddress) const;
 
 };

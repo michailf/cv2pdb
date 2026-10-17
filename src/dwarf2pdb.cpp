@@ -1991,7 +1991,7 @@ bool CV2PDB::createTypes()
 					else
 					{
 						if (debug & DbgPdbContrib)
-							fprintf(stderr, "%s:%d: Adding a section contrib: %x-%x\n", __FUNCTION__, __LINE__,
+							fprintf(stderr, "%s:%d: Adding a section contrib: %I64x-%I64x\n", __FUNCTION__, __LINE__,
 									id.pclo, id.pchi);
 
 						if (!addDWARFSectionContrib(mod, id.pclo, id.pchi))
@@ -2020,10 +2020,9 @@ bool CV2PDB::createTypes()
 						Location loc = decodeLocation(id.location, 0, 0, &cursor);
 						if (loc.is_abs())
 						{
-							segOff = loc.off;
-							seg = imgDbg->findSection(segOff);
+							seg = imgDbg->findSection(loc.off);
 							if (seg >= 0)
-								segOff -= imgDbg->getImageBase() + imgDbg->getSection(seg).VirtualAddress;
+								segOff = loc.off - imgDbg->getImageBase() - imgDbg->getSection(seg).VirtualAddress;
 						}
 					}
 					if (seg >= 0)

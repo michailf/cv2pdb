@@ -93,7 +93,7 @@ static Location mkInReg(unsigned reg)
 	return l;
 }
 
-static Location mkAbs(int off)
+static Location mkAbs(int64_t off)
 {
 	Location l;
 	l.type = Location::Abs;
@@ -102,7 +102,7 @@ static Location mkAbs(int off)
 	return l;
 }
 
-static Location mkRegRel(int reg, int off)
+static Location mkRegRel(int reg, int64_t off)
 {
 	Location l;
 	l.type = Location::RegRel;
@@ -371,9 +371,9 @@ Location decodeLocation(const DWARF_Attribute& attr, const Location* frameBase, 
 			case DW_OP_rot:   if (stackDepth < 3) return invalid; { Location tmp = stack[stackDepth - 1]; stack[stackDepth - 1] = stack[stackDepth - 2]; stack[stackDepth - 2] = stack[stackDepth - 3]; stack[stackDepth - 3] = tmp; } break;
 
 			case DW_OP_addr:
-				if (end - p < 4)
+				if (!cursor || end - p < (cursor->cu->address_size == 4 ? 4 : 8))
 					return invalid;
-				stack[stackDepth++] = mkAbs(RD4(p)); // TODO: 64-bit
+				stack[stackDepth++] = mkAbs(cursor->RDAddr(p));
 				break;
 
 			case DW_OP_skip:
@@ -523,43 +523,43 @@ bool LOCCursor::readNext(LOCEntry& entry)
 	{
 		// The logic here is goverened by DWARF4 section 2.6.2.
 
-		if (ptr >= end)
-			return false;
+		while (ptr < end)
+		{
+			if (parent.debug & DbgDwarfLocLists)
+				fprintf(stderr, "%s:%d: loclist off=%x DIEoff=%x:\n", __FUNCTION__, __LINE__,
+						parent.img->debug_loc.sectOff(ptr), parent.entryOff);
 
-		if (parent.debug & DbgDwarfLocLists)
-			fprintf(stderr, "%s:%d: loclist off=%x DIEoff=%x:\n", __FUNCTION__, __LINE__,
-					parent.img->debug_loc.sectOff(ptr), parent.entryOff);
+			// Extract the begin and end offset
+			// TODO: Why is this truncating to 32 bit?
+			entry.beg_offset = (unsigned long) parent.RDAddr(ptr);
+			entry.end_offset = (unsigned long) parent.RDAddr(ptr);
 
-		// Extract the begin and end offset
-		// TODO: Why is this truncating to 32 bit?
-		entry.beg_offset = (unsigned long) parent.RDAddr(ptr);
-		entry.end_offset = (unsigned long) parent.RDAddr(ptr);
+			// Check for a base-address-selection entry.
+			if (entry.beg_offset == -1U) {
+				// This is a base address selection entry and thus has no location
+				// description.
+				// Update the base address with this entry's value.
+				base = entry.end_offset;
 
-		// Check for a base-address-selection entry.
-		if (entry.beg_offset == -1U) {
-			// This is a base address selection entry and thus has no location
-			// description.
-			// Update the base address with this entry's value.
-			base = entry.end_offset;
+				// Continue the scan, but don't try to decode further since there
+				// are no location description records following this type of entry.
+				continue;
+			}
 
-			// Continue the scan, but don't try to decode further since there
-			// are no location description records following this type of entry.
+			// Check for end-of-list entry. (Both offsets 0)
+			if (!entry.beg_offset && !entry.end_offset) {
+				// Terminate the scan.
+				return false;
+			}
+
+			DWARF_Attribute attr;
+			attr.type = Block;
+			attr.block.len = RD2(ptr);
+			attr.block.ptr = ptr;
+			entry.loc = decodeLocation(attr);
+			ptr += attr.expr.len;
 			return true;
 		}
-
-		// Check for end-of-list entry. (Both offsets 0)
-		if (!entry.beg_offset && !entry.end_offset) {
-			// Terminate the scan.
-			return false;
-		}
-
-		DWARF_Attribute attr;
-		attr.type = Block;
-		attr.block.len = RD2(ptr);
-		attr.block.ptr = ptr;
-		entry.loc = decodeLocation(attr);
-		ptr += attr.expr.len;
-		return true;
 	}
 
 	return false;
@@ -725,7 +725,7 @@ const char* DIECursor::resolveIndirectString(uint32_t index) const
 	return (const char*)img->debug_str.byteAt(RDref(refAddr));
 }
 
-uint32_t DIECursor::readIndirectAddr(uint32_t index) const
+uint64_t DIECursor::readIndirectAddr(uint32_t index) const
 {
 	if (!cu->addr_base)
 	{
