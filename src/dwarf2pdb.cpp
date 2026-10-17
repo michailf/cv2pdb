@@ -1019,6 +1019,7 @@ bool CV2PDB::addDWARFProc(DWARF_InfoData& procid, const std::vector<RangeEntry> 
 		frameBase = findBestFBLoc(cursor, frameBase.off);
 
     Location cfa = findBestCFA(*imgDbg, cfi_index, procid.pclo, procid.pchi);
+	DWARFLocalWriter locals(*this, procid, cursor, ranges.front(), frameBase, cfa);
 
 	if (cursor.cu)
 	{
@@ -1038,7 +1039,9 @@ bool CV2PDB::addDWARFProc(DWARF_InfoData& procid, const std::vector<RangeEntry> 
 				mergeAbstractOrigin(id, *this);
 			if (id.tag == DW_TAG_formal_parameter && id.name)
 			{
-				if (id.location.type == ExprLoc || id.location.type == Block || id.location.type == SecOffset)
+				if (locals.enabled())
+					locals.add(id, cursor, true);
+				else if (id.location.type == ExprLoc || id.location.type == Block || id.location.type == SecOffset)
 				{
 					Location loc = id.location.type == SecOffset ? findBestFBLoc(cursor, id.location.sec_offset)
 					                                             : decodeLocation(id.location, &frameBase);
@@ -1110,7 +1113,9 @@ bool CV2PDB::addDWARFProc(DWARF_InfoData& procid, const std::vector<RangeEntry> 
 					// Found a local variable.
 					if (id.abstract_origin)
 						mergeAbstractOrigin(id, *this);
-					if (id.name && (id.location.type == ExprLoc || id.location.type == Block))
+					if (id.name && locals.enabled())
+						locals.add(id, cursor, false);
+					else if (id.name && (id.location.type == ExprLoc || id.location.type == Block))
 					{
 						Location loc = id.location.type == SecOffset ? findBestFBLoc(cursor, id.location.sec_offset)
 						                                             : decodeLocation(id.location, &frameBase);
