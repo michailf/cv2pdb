@@ -36,6 +36,9 @@ jobs:
     runs-on: windows-latest
     needs: build
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: test
       - name: Download bin/
         uses: actions/download-artifact@v4
         with:
@@ -130,6 +133,68 @@ jobs:
                  $2 == "S_END" { if (d) d--; else inp = 0 }
                  inp && $2 == "S_REGREL32:" && $NF == "local" { print; split($3, r, /[+,]/); ok = r[1] == "rsp" && strtonum("0x" r[2]) == slot }
                  END { printf "expected rsp+%x\n", slot; exit !(n == 1 && ok) }' frame-d$v.asm frame-cv-d$v.dump || exit 1
+          done
+      - name: build and convert program with location lists (gcc)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -x &&
+          cat >stacked.c <<-\EOF &&
+          __attribute__((noinline)) int stacked(int a, int b, int c, int d, int e)
+          {
+            volatile int buf[16];
+            for (int i = 0; i < 16; i++)
+              buf[i] = a * i + b;
+            e += buf[c & 15] * d;
+            return buf[d & 15] + e * c;
+          }
+
+          int main(int argc, char **argv)
+          {
+            return stacked(argc, argc + 1, argc + 2, argc + 3, argc + 4);
+          }
+          EOF
+
+          curl -Lo cvdump.exe https://raw.githubusercontent.com/microsoft/microsoft-pdb/HEAD/cvdump/cvdump.exe &&
+          for v in 4 5; do
+            gcc -g -gdwarf-$v -O2 -dA -S -o stacked-d$v.s stacked.c &&
+            { awk -v v=$v '$1 == ".section" { loc = $2 ~ /^\.debug_loc(lists)?,/ }
+                           loc && /# Location list begin address/ { lists = 1 }
+                           loc && /# DW_LLE_base_address / { base = 1 }
+                           END { exit !(lists && (v == 4 || base)) }' stacked-d$v.s ||
+              { echo "test precondition lost: stacked-d$v.s has no location lists, or (DWARF 5) none that starts with DW_LLE_base_address"; exit 1; }; } &&
+            gcc -g -gdwarf-$v -O2 -c -o stacked-d$v.o stacked.c &&
+            gcc -o stacked-d$v.exe stacked-d$v.o &&
+            llvm-objdump -d --debug-vars=ascii --no-show-raw-insn --disassemble-symbols=stacked stacked-d$v.o >stacked-d$v.vars &&
+            bin/${{env.BUILD_CONFIGURATION}}*/cv2pdb.exe stacked-d$v.exe stacked-cv-d$v.exe &&
+            ./cvdump.exe -s stacked-cv-d$v.pdb >stacked-cv-d$v.dump || exit 1
+          done
+      - name: verify stack parameters across frame allocation (gcc)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -x &&
+          for v in 4 5; do
+            frame=$(awk '/^[0-9a-f]+ <stacked>:$/ { f = 1; next }
+                         !f { next }
+                         /[\/|]- e = .*fbreg/ { slot = 1 }
+                         /^ *[0-9a-f]+:/ { if (slot && match($0, /subq\t\$0x([0-9a-f]+), %rsp/, m)) print strtonum("0x" m[1]); exit }' stacked-d$v.vars) &&
+            { test -n "$frame" || { echo "test precondition lost: e is not in its stack slot at the entry of stacked, or stacked does not start by allocating its frame"; exit 1; }; } &&
+            awk -v frame=$frame '$2 == "S_GPROC32:" { inp = $NF == "stacked"; split($3, a, /[:\]]/); if (inp) lo = strtonum("0x" a[2]); var = ""; next }
+                 !inp { next }
+                 $2 == "S_LOCAL:" { var = $NF; if (var == "e") print; next }
+                 var == "e" && $2 ~ /^S_DEFRANGE_/ { print; slot = $2 == "S_DEFRANGE_REGISTER_REL:" && $3 == "[rsp" && NF == 6 ? strtonum("0x" $5) : -1; next }
+                 var == "e" && $1 == "Range:" { print; split($2, s, /[:\]]/); split($4, x, /[:\]]/); rs = strtonum("0x" s[2]); at[rs] = slot; end[rs] = strtonum("0x" x[2]) }
+                 $2 ~ /^S_/ && $2 !~ /^S_DEFRANGE_/ { var = "" }
+                 END { printf "expected rsp+%x, then rsp+%x\n", 40, 40 + frame; exit !(at[lo] == 40 && at[end[lo]] == 40 + frame) }' stacked-cv-d$v.dump || exit 1
+          done
+      - name: verify S_LOCAL records against the DWARF (gcc)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -x &&
+          for v in 4 5; do
+            awk -v want='stacked:a stacked:b stacked:c stacked:d stacked:e' -f test/check-locals.awk stacked-d$v.vars stacked-d$v.vars stacked-cv-d$v.dump || exit 1
           done
   test-dwarf5:
     runs-on: windows-latest
