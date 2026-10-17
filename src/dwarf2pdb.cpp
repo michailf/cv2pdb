@@ -402,16 +402,6 @@ public:
 		ptr = beg;
 	}
 
-	bool beforeRestore()
-	{
-		if(ptr >= end)
-			return false;
-		byte instr = *ptr;
-		if ((instr & 0xc0) == DW_CFA_restore || instr == DW_CFA_restore_extended || instr == DW_CFA_restore_state)
-			return true;
-		return false;
-	}
-
 	bool processNext()
 	{
 		if(ptr >= end)
@@ -439,13 +429,13 @@ public:
 				loc = RDsize(ptr, entry.address_size);
 				break;
 			case DW_CFA_advance_loc1:
-				loc = *ptr++;
+				loc += *ptr++ * entry.code_alignment_factor;
 				break;
 			case DW_CFA_advance_loc2:
-				loc = RDsize(ptr, 2);
+				loc += RDsize(ptr, 2) * entry.code_alignment_factor;
 				break;
 			case DW_CFA_advance_loc4:
-				loc = RDsize(ptr, 4);
+				loc += RDsize(ptr, 4) * entry.code_alignment_factor;
 				break;
 
 			case DW_CFA_def_cfa:
@@ -506,12 +496,8 @@ public:
 			case DW_CFA_val_expression:
 			{
 				reg = LEB128(ptr); // set register rule to "expression"
-				DWARF_Attribute attr;
-				attr.type = Block;
-				attr.block.len = LEB128(ptr);
-				attr.block.ptr = ptr;
-				cfa = decodeLocation(attr); // TODO: push cfa on stack
-				ptr += attr.expr.len;
+				unsigned len = LEB128(ptr);
+				ptr += len;
 				break;
 			}
 			case DW_CFA_restore_extended:
@@ -530,7 +516,15 @@ public:
 				break;
 
 			case DW_CFA_remember_state:
+				saved.push_back(cfa);
+				break;
 			case DW_CFA_restore_state:
+				if (!saved.empty())
+				{
+					cfa = saved.back();
+					saved.pop_back();
+				}
+				break;
 			case DW_CFA_nop:
 				break;
 			}
@@ -546,6 +540,7 @@ public:
 
 	unsigned long long loc;
 	Location cfa;
+	std::vector<Location> saved;
 };
 
 Location findBestCFA(const PEImage& img, const CFIIndex* index, unsigned int pclo, unsigned int pchi)
@@ -565,11 +560,32 @@ Location findBestCFA(const PEImage& img, const CFIIndex* index, unsigned int pcl
 
 	if (cursor.readNext(entry))
 	{
-		CFACursor cfa(img, entry, pclo);
+		CFACursor cfa(img, entry, entry.initial_location);
 		while (cfa.processNext()) {}
 		cfa.setInstructions(entry.instructions, entry.instructions_length);
-		while (!cfa.beforeRestore() && cfa.processNext()) {}
-		return cfa.cfa;
+
+		// The row covering the most code is taken to be the function body between the
+		// prologue and the epilogues, where the stack variables are live.
+		Location best = cfa.cfa;
+		unsigned long long best_size = 0;
+		unsigned long long row_start = cfa.loc;
+		unsigned long long fde_end = (unsigned long long) entry.initial_location + entry.address_range;
+		for (bool more = true; more; )
+		{
+			Location row = cfa.cfa;
+			more = cfa.processNext();
+			unsigned long long row_end = more ? cfa.loc : fde_end;
+			if (row_end > row_start)
+			{
+				if (row_end - row_start > best_size)
+				{
+					best_size = row_end - row_start;
+					best = row;
+				}
+				row_start = row_end;
+			}
+		}
+		return best;
 	}
 	return ebp;
 }
@@ -936,8 +952,10 @@ bool CV2PDB::addDWARFProc(DWARF_InfoData& procid, const std::vector<RangeEntry> 
 		// First, collect all the formal parameters of the proc.
 		// Don't worry about storing these in the tree as we're not going to need
 		// to generate fully-qualified names like we would for functions/classes.
-		while (cursor.readNext(&id, true /* stopAtNull */))
+		while (procid.hasChild && cursor.readNext(&id, true /* stopAtNull */))
 		{
+			if (id.tag == DW_TAG_formal_parameter && id.abstract_origin)
+				mergeAbstractOrigin(id, *this);
 			if (id.tag == DW_TAG_formal_parameter && id.name)
 			{
 				if (id.location.type == ExprLoc || id.location.type == Block || id.location.type == SecOffset)
@@ -948,6 +966,9 @@ bool CV2PDB::addDWARFProc(DWARF_InfoData& procid, const std::vector<RangeEntry> 
 						appendStackVar(id.name, getTypeByDWARFPtr(id.type), loc, cfa);
 				}
 			}
+			// The parameters of an inlined subroutine within this function are not parameters of
+			// this function, so the scan skips the children of each entry it reads.
+			cursor.gotoSibling();
 		}
 		appendEndArg();
 
@@ -1007,6 +1028,8 @@ bool CV2PDB::addDWARFProc(DWARF_InfoData& procid, const std::vector<RangeEntry> 
 				else if (id.tag == DW_TAG_variable)
 				{
 					// Found a local variable.
+					if (id.abstract_origin)
+						mergeAbstractOrigin(id, *this);
 					if (id.name && (id.location.type == ExprLoc || id.location.type == Block))
 					{
 						Location loc = id.location.type == SecOffset ? findBestFBLoc(cursor, id.location.sec_offset)
