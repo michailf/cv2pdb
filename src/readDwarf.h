@@ -476,20 +476,19 @@ struct Location
 class LOCEntry
 {
 public:
-	unsigned long beg_offset;
-	unsigned long end_offset;
+	// The addresses that the entry covers, with the base address of the list applied.
+	uint64_t beg_offset;
+	uint64_t end_offset;
 
 	// DWARF v5 only. See DW_LLE_default_location.
-	bool isDefault;
+	bool isDefault = false;
 
 	// Location description.
 	Location loc = { Location::Invalid };
 
-	void addBase(uint32_t base)
-	{
-		beg_offset += base;
-		end_offset += base;
-	}
+	// The expression that `loc` is decoded from. `loc` is decoded without a frame base, so it is
+	// invalid for an expression that uses DW_OP_fbreg.
+	DWARF_Attribute expr = {};
 };
 
 // Location list cursor (see DWARF v4 and v5 Section 2.6).
@@ -502,9 +501,7 @@ public:
 
 	// The base address for subsequent loc list entries read in a given list.
 	// Default to the CU base in the absense of any base address selection entries.
-	//
-	// TODO: So far we only assign to this but never actually use it.
-	uint32_t base;
+	uint64_t base;
 
 	byte* end;
 	byte* ptr;
