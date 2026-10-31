@@ -1011,7 +1011,7 @@ bool CV2PDB::addDWARFProc(DWARF_InfoData& procid, const std::vector<RangeEntry> 
 
 		// Start from the proc base, and push all nested lexical blocks as you
 		// encounter them.
-		lexicalBlocks.push_back(prev);
+		lexicalBlocks.push_back(prev.getSubtreeCursor());
 
 		while (!lexicalBlocks.empty())
 		{
