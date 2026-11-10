@@ -1059,7 +1059,7 @@ bool CV2PDB::addDWARFProc(DWARF_InfoData& procid, const std::vector<RangeEntry> 
 			if (id.tag == DW_TAG_formal_parameter && id.name)
 			{
 				if (locals.enabled())
-					locals.add(id, cursor, true, paramConstants);
+					locals.add(id, cursor, true, 0, ~0ull, paramConstants);
 				else if (id.location.type == ExprLoc || id.location.type == Block || id.location.type == SecOffset)
 				{
 					Location loc = id.location.type == SecOffset ? findBestFBLoc(cursor, id.location.sec_offset)
@@ -1139,7 +1139,7 @@ void CV2PDB::appendScopeSymbols(DIECursor children, uint64_t lo, uint64_t hi, Lo
 			{
 				names.insert(id.name);
 				if (locals.enabled())
-					locals.add(id, cursor, false, constants);
+					locals.add(id, cursor, false, lo, hi, constants);
 				else if (id.location.type == ExprLoc || id.location.type == Block)
 				{
 					Location loc = id.location.type == SecOffset ? findBestFBLoc(cursor, id.location.sec_offset)
